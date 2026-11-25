@@ -9,5 +9,5 @@ for(const f of fs.readdirSync('.').sort()){
   if(m){(big[m[1]]=big[m[1]]||[]).push(fs.readFileSync(f,'utf8'));continue}
   out(f.slice(5),fs.readFileSync(f));
 }
-for(const [rel,parts] of Object.entries(big))out(rel,zlib.gunzipSync(Buffer.from(parts.join(''),'base64')));
+for(const [rel,parts] of Object.entries(big))out(rel,zlib.gunzipSync(Buffer.from(parts.join('').replace(/\s/g,''),'base64')));
 console.log('dist pronto:',fs.readdirSync('dist').join(','));
