@@ -59,7 +59,10 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
     const s=await snap('data:'+req.user.role,String(req.user.id));
     if(!s)fail('Os dados ainda não chegaram da escola. Tente de novo mais tarde.',503);
     const sync=await snap('meta','sync');
-    res.json({...s.data,home:{online:true,updated_at:sync?.data?.updated_at||null,received_ms:sync?.updated_ms||null}});
+    const reqs=await q('SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? ORDER BY created_ms DESC LIMIT 30',[req.user.role,req.user.id]);
+    const waiting=Number((await q("SELECT COALESCE(SUM(spend),0) n FROM educa_requests WHERE role=? AND subject_id=? AND status='esperando'",[req.user.role,req.user.id]))[0]?.n||0);
+    const base=Number(s.data.student?.available_balance??s.data.student?.balance??0);
+    res.json({...s.data,home:{online:true,updated_at:sync?.data?.updated_at||null,received_ms:sync?.updated_ms||null,can_act:true,free_balance:req.user.role==='student'?Math.max(0,base-waiting):null,waiting_spend:waiting,requests:reqs.map(r=>({...r,created_ms:Number(r.created_ms),done_ms:r.done_ms?Number(r.done_ms):null}))}});
   }catch(e){next(e)}});
 
   // Sincronizador do computador da escola
@@ -78,7 +81,97 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
   }catch(e){next(e)}});
   app.get('/api/sync/hashes',syncAuth,async(req,res,next)=>{try{const rows=await q('SELECT kind,k,hash FROM educa_snap');res.json(Object.fromEntries(rows.map(r=>[r.kind+'|'+r.k,r.hash])))}catch(e){next(e)}});
 
-  // Tudo que muda dados fica só na escola
+  // ---------- ações em casa: viram PEDIDOS; só o computador da escola decide e aplica ----------
+  const norm=t=>String(t||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();
+  const num=(v,min,max,msg)=>{const n=Number(String(v).replace(',','.'));if(!Number.isFinite(n)||n<min||n>max)fail(msg);return n};
+  const brl=c=>'R$ '+(c/100).toFixed(2).replace('.',',');
+  const pendingSpend=async(role,id)=>Number((await q("SELECT COALESCE(SUM(spend),0) n FROM educa_requests WHERE role=? AND subject_id=? AND status='esperando'",[role,id]))[0]?.n||0);
+  const verifyPin=async(id,pin)=>{
+    const acc=(await q("SELECT data FROM educa_snap WHERE kind='account' AND k LIKE 'student:%'",[])).map(r=>JSON.parse(r.data)).find(a=>a.id===id);
+    if(!acc||!/^\d{4}$/.test(String(pin||'')))fail('Digite a sua senha de 4 números.',403);
+    const key='pin:'+id,at=(await q('SELECT failures,locked FROM educa_attempts WHERE k=?',[key]))[0];
+    if(at&&Number(at.locked)>now())fail('Calma! Tente de novo daqui a pouco.',429);
+    const h=await pbk(String(pin),acc.senha_salt);
+    if(!timingSafeEqual(h,Buffer.from(acc.senha_hash,'hex'))){const n=(at?Number(at.failures):0)+1;const lock=n>=4?now()+10*60000:0;await q('INSERT INTO educa_attempts(k,failures,locked) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET failures=excluded.failures,locked=excluded.locked',[key,n,lock]);fail('Senha incorreta.',403)}
+    await q('DELETE FROM educa_attempts WHERE k=?',[key]);
+  };
+  const HOME_STUDENT=['consultarPix','transferirPix','solicitarEmprestimo','poupancaGuardar','poupancaTirar','jogosComprarMoedas'];
+  const HOME_TEACHER=['registrarMovimentacao','registrarMulta'];
+  app.post('/api/action',auth,limit('action',60,60000),async(req,res,next)=>{try{
+    const {action,payload:p={}}=req.body||{};const role=req.user.role,id=req.user.id;
+    if(!(role==='student'?HOME_STUDENT:HOME_TEACHER).includes(action))fail(HOME_MSG,403);
+    const dat=(await snap('data:'+role,String(id)))?.data;if(!dat)fail('Os dados ainda não chegaram da escola. Tente de novo mais tarde.',503);
+    if(action==='consultarPix'){
+      const acct=String(p.account||'').trim().toUpperCase().slice(0,20);
+      const rows=await q("SELECT k,data FROM educa_snap WHERE kind='account' AND k=?",['student:'+acct]);
+      const a=rows[0]&&JSON.parse(rows[0].data);
+      if(!a||a.id===id||!a.first_name||a.status!=='ativa')fail('Conta não encontrada.');
+      return res.json({id:a.id,name:a.first_name,account:acct});
+    }
+    const key=req.get('Idempotency-Key');if(!key||!/^[a-zA-Z0-9-]{16,80}$/.test(key))fail('Chave de operação inválida.');
+    const rid='home-'+key.slice(0,70);
+    const prior=(await q('SELECT id,status FROM educa_requests WHERE id=?',[rid]))[0];
+    if(prior)return res.json({request_id:prior.id,status:prior.status,repeated:true});
+    const pend=Number((await q("SELECT COUNT(*) n FROM educa_requests WHERE role=? AND subject_id=? AND status='esperando'",[role,id]))[0].n);
+    if(pend>=8)fail('Você já tem muitos pedidos esperando. Espere o professor responder.',429);
+    let out={},spend=0,summary='';
+    if(role==='student'){
+      const free=Number(dat.student?.available_balance??dat.student?.balance??0)-await pendingSpend('student',id);
+      if(action==='transferirPix'){
+        if(!dat.config?.permitir_pix)fail('O Pix ainda não está liberado.');
+        const amount=num(p.amount,0.01,100000,'Digite um valor de Pix certo.');const cents=Math.round(amount*100);
+        if(cents>free)fail('Você não tem saldo livre para isso agora. Seu saldo livre é '+brl(Math.max(0,free))+'.');
+        await verifyPin(id,p.pin);
+        const acct=String(p.account||'').trim().toUpperCase().slice(0,20);const a=(await q("SELECT data FROM educa_snap WHERE kind='account' AND k=?",['student:'+acct]))[0];const ad=a&&JSON.parse(a.data);
+        if(!ad||ad.id!==Number(p.recipient_id)||ad.id===id)fail('Confira o nome de quem vai receber.');
+        out={account:acct,recipient_id:ad.id,amount};spend=cents;summary='Pix de '+brl(cents)+' para '+ad.first_name;
+      }else if(action==='poupancaGuardar'){
+        const amount=num(p.amount,0.01,100000,'Digite um valor certo.');const cents=Math.round(amount*100);
+        if(cents>free)fail('Você não tem saldo livre para isso agora. Seu saldo livre é '+brl(Math.max(0,free))+'.');
+        out={amount};spend=cents;summary='Guardar '+brl(cents)+' no cofrinho';
+      }else if(action==='poupancaTirar'){
+        const amount=num(p.amount,0.01,100000,'Digite um valor certo.');out={amount};summary='Tirar '+brl(Math.round(amount*100))+' do cofrinho';
+      }else if(action==='jogosComprarMoedas'){
+        const qty=Math.round(num(p.qty,1,20,'Escolha de 1 a 20 moedas.'));const price=Number(dat.games?.coin_price||0);if(price<=0)fail('A compra de moedas está desligada.');
+        const cents=price*qty;if(cents>free)fail('Você não tem saldo livre para isso agora. Seu saldo livre é '+brl(Math.max(0,free))+'.');
+        out={qty};spend=cents;summary='Comprar '+qty+' moeda'+(qty>1?'s':'')+' ('+brl(cents)+')';
+      }else if(action==='solicitarEmprestimo'){
+        const amount=num(p.amount,0.01,1000000,'Digite um valor certo.');const count=Math.round(num(p.count,1,36,'Escolha as parcelas.'));
+        const room=Number(dat.student?.loan_free??dat.student?.loan_limit??0);if(Math.round(amount*100)>room)fail('Esse valor passa do seu limite. Você ainda pode pedir '+brl(room)+'.');
+        await verifyPin(id,p.pin);out={amount,count};summary='Pedir empréstimo de '+brl(Math.round(amount*100))+' em '+count+' parcela'+(count>1?'s':'');
+      }
+    }else{
+      const st=(dat.students||[]).find(s=>s.id===Number(p.student_id));if(!st)fail('Aluno fora da sua turma.',403);
+      if(action==='registrarMovimentacao'){
+        const amount=num(p.amount,0.01,100000,'Digite um valor certo.');const kind=['credito','bonus'].includes(p.kind)?p.kind:'credito';
+        out={student_id:st.id,direction:'in',kind,amount,description:String(p.description||'').trim().slice(0,200)||'Crédito do professor'};if(!String(p.description||'').trim())fail('Escreva o motivo do crédito.');
+        summary='Crédito de '+brl(Math.round(amount*100))+' para '+st.name;
+      }else{
+        const t=(dat.fine_types||[]).find(f=>f.id===Number(p.type_id)&&f.active);if(!t)fail('Escolha uma multa da lista.');
+        out={student_id:st.id,type_id:t.id,reason:String(p.reason||'').trim().slice(0,150)};summary='Multa "'+t.name+'" para '+st.name;
+      }
+    }
+    await q('INSERT INTO educa_requests(id,role,subject_id,action,payload,spend,status,summary,created_ms) VALUES(?,?,?,?,?,?,?,?,?)',[rid,role,id,action,JSON.stringify(out),spend,'esperando',summary,now()]);
+    res.json({request_id:rid,status:'esperando',summary});
+  }catch(e){next(e)}});
+  app.get('/api/requests',auth,async(req,res,next)=>{try{
+    const rows=await q('SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? ORDER BY created_ms DESC LIMIT 30',[req.user.role,req.user.id]);
+    res.json({requests:rows.map(r=>({...r,created_ms:Number(r.created_ms),done_ms:r.done_ms?Number(r.done_ms):null}))});
+  }catch(e){next(e)}});
+  // O computador da escola busca os pedidos e devolve o resultado
+  app.get('/api/sync/requests',syncAuth,async(req,res,next)=>{try{
+    const rows=await q("SELECT id,role,subject_id,action,payload,created_ms FROM educa_requests WHERE status='esperando' ORDER BY created_ms ASC LIMIT 25",[]);
+    res.json({requests:rows.map(r=>({id:r.id,role:r.role,subject_id:Number(r.subject_id),action:r.action,payload:JSON.parse(r.payload),created_ms:Number(r.created_ms)}))});
+  }catch(e){next(e)}});
+  app.post('/api/sync/requests/result',limit('syncres',120,60000),syncAuth,async(req,res,next)=>{try{
+    let n=0;for(const r of Array.isArray(req.body?.results)?req.body.results:[]){
+      if(typeof r?.id!=='string'||!['feito','nao_deu'].includes(r.status))continue;
+      const u=await q("UPDATE educa_requests SET status=?,reason=?,done_ms=?,spend=0 WHERE id=? AND status='esperando' RETURNING id",[r.status,String(r.reason||'').slice(0,300),now(),r.id]);n+=u.length}
+    await q('DELETE FROM educa_requests WHERE done_ms IS NOT NULL AND done_ms<?',[now()-30*86400000]);
+    res.json({ok:true,updated:n});
+  }catch(e){next(e)}});
+
+  // Todo o resto que muda dados fica só na escola
   app.all('/api/*splat',(req,res)=>res.status(403).json({error:HOME_MSG}));
 
   const dist=distDir;
