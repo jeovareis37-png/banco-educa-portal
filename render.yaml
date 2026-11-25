@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: banco-educa-portal
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev && node setup.mjs
+    startCommand: node server.mjs
+    healthCheckPath: /healthz
+    envVars:
+      - key: SYNC_KEY
+        sync: false
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
