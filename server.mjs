@@ -28,7 +28,7 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
 
   app.post('/api/login',limit('login',40,15*60000),async(req,res,next)=>{try{
     const p=req.body||{};
-    if(p.role==='admin')fail('O gerente entra só no computador da escola.',403);
+    if(p.role==='admin')fail('O gerente não entra por aqui.',403);
     if(!['student','teacher'].includes(p.role))fail('Perfil inválido.');
     const login=String(p.login||'').trim().toUpperCase().slice(0,60),pw=String(p.password||'');
     if(!login||pw.length>128)fail('Usuário/conta ou senha incorretos.',401);
