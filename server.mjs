@@ -62,7 +62,21 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
     const reqs=await q('SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? ORDER BY created_ms DESC LIMIT 30',[req.user.role,req.user.id]);
     const waiting=Number((await q("SELECT COALESCE(SUM(spend),0) n FROM educa_requests WHERE role=? AND subject_id=? AND status='esperando'",[req.user.role,req.user.id]))[0]?.n||0);
     const base=Number(s.data.student?.available_balance??s.data.student?.balance??0);
-    res.json({...s.data,home:{online:true,updated_at:sync?.data?.updated_at||null,received_ms:sync?.updated_ms||null,can_act:true,free_balance:req.user.role==='student'?Math.max(0,base-waiting):null,waiting_spend:waiting,requests:reqs.map(r=>({...r,created_ms:Number(r.created_ms),done_ms:r.done_ms?Number(r.done_ms):null}))}});
+    let out={...s.data};let free=null;
+    if(req.user.role==='student'){
+      // Valores já com os pedidos que esperam: o mesmo número em todas as telas do aluno em casa
+      const pend=await q("SELECT action,payload FROM educa_requests WHERE role=? AND subject_id=? AND status='esperando'",[req.user.role,req.user.id]);
+      let dBal=0,dSav=0;
+      for(const r of pend){let p={};try{p=JSON.parse(r.payload)}catch{}const c=Math.round(Number(p.amount||0)*100);
+        if(r.action==='transferirPix')dBal-=c;
+        else if(r.action==='poupancaGuardar'){dBal-=c;dSav+=c}
+        else if(r.action==='poupancaTirar'){dBal+=c;dSav-=c}
+        else if(r.action==='jogosComprarMoedas')dBal-=Number(dat_coinPrice(s.data))*Number(p.qty||0)}
+      free=Math.max(0,base+dBal);
+      if(out.student){out.student={...out.student,available_balance:free};if(out.student.balance!=null)out.student.balance_with_requests=free}
+      if(out.savings){const sv=out.savings;out.savings={...sv,balance:Math.max(0,Number(sv.balance||0)+dSav),available:Math.max(0,Number(sv.available||0)+Math.min(0,dSav)),pending:pend.some(r=>String(r.action).startsWith('poupanca'))}}
+    }
+    res.json({...out,home:{online:true,updated_at:sync?.data?.updated_at||null,received_ms:sync?.updated_ms||null,can_act:true,free_balance:free,waiting_spend:waiting,requests:reqs.map(r=>({...r,created_ms:Number(r.created_ms),done_ms:r.done_ms?Number(r.done_ms):null}))}});
   }catch(e){next(e)}});
 
   // Sincronizador do computador da escola
@@ -83,6 +97,7 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
 
   // ---------- ações em casa: viram PEDIDOS; só o computador da escola decide e aplica ----------
   const norm=t=>String(t||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();
+  const dat_coinPrice=d=>Number(d?.games?.coin_price||0);
   const num=(v,min,max,msg)=>{const n=Number(String(v).replace(',','.'));if(!Number.isFinite(n)||n<min||n>max)fail(msg);return n};
   const brl=c=>'R$ '+(c/100).toFixed(2).replace('.',',');
   const pendingSpend=async(role,id)=>Number((await q("SELECT COALESCE(SUM(spend),0) n FROM educa_requests WHERE role=? AND subject_id=? AND status='esperando'",[role,id]))[0]?.n||0);
@@ -175,7 +190,7 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
   app.all('/api/*splat',(req,res)=>res.status(403).json({error:HOME_MSG}));
 
   const dist=distDir;
-  if(dist&&fs.existsSync(dist)){app.use(express.static(dist,{maxAge:'1h'}));app.get('/{*path}',(req,res)=>res.sendFile(path.join(dist,'index.html')))}
+  if(dist&&fs.existsSync(dist)){app.use(express.static(dist,{maxAge:0,etag:true,setHeaders:(res,f)=>{if(f.endsWith('.html'))res.setHeader('Cache-Control','no-cache')}}));app.get('/{*path}',(req,res)=>{if(/^\/assets\//.test(req.path)||/\.[a-z0-9]{2,5}$/i.test(req.path))return res.status(404).end();res.setHeader('Cache-Control','no-cache');res.sendFile(path.join(dist,'index.html'))})}
   app.use((err,req,res,next)=>{if(err.type==='entity.too.large')return res.status(413).json({error:'Pacote grande demais.'});if(err.status)return res.status(err.status).json({error:err.message});console.error('Erro interno:',err.message);res.status(500).json({error:'Não foi possível concluir agora. Tente de novo em instantes.'})});
   return app;
 }
