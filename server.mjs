@@ -59,7 +59,8 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
     const s=await snap('data:'+req.user.role,String(req.user.id));
     if(!s)fail('Os dados ainda não chegaram da escola. Tente de novo mais tarde.',503);
     const sync=await snap('meta','sync');
-    const reqs=await q('SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? ORDER BY created_ms DESC LIMIT 30',[req.user.role,req.user.id]);
+    const reqs=await q("SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? AND action NOT IN ('msgResponder','msgLer') ORDER BY created_ms DESC LIMIT 30",[req.user.role,req.user.id]);
+    const msgWait=(await q("SELECT summary FROM educa_requests WHERE role=? AND subject_id=? AND action='msgResponder' AND status='esperando' ORDER BY created_ms",[req.user.role,req.user.id])).map(r=>r.summary);
     const waiting=Number((await q("SELECT COALESCE(SUM(spend),0) n FROM educa_requests WHERE role=? AND subject_id=? AND status='esperando'",[req.user.role,req.user.id]))[0]?.n||0);
     const base=Number(s.data.student?.available_balance??s.data.student?.balance??0);
     let out={...s.data};let free=null;
@@ -76,7 +77,7 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
       if(out.student){out.student={...out.student,available_balance:free};if(out.student.balance!=null)out.student.balance_with_requests=free}
       if(out.savings){const sv=out.savings;out.savings={...sv,balance:Math.max(0,Number(sv.balance||0)+dSav),available:Math.max(0,Number(sv.available||0)+Math.min(0,dSav)),pending:pend.some(r=>String(r.action).startsWith('poupanca'))}}
     }
-    res.json({...out,home:{online:true,updated_at:sync?.data?.updated_at||null,received_ms:sync?.updated_ms||null,can_act:true,free_balance:free,waiting_spend:waiting,requests:reqs.map(r=>({...r,created_ms:Number(r.created_ms),done_ms:r.done_ms?Number(r.done_ms):null}))}});
+    res.json({...out,home:{online:true,updated_at:sync?.data?.updated_at||null,received_ms:sync?.updated_ms||null,can_act:true,msg_pending:msgWait,free_balance:free,waiting_spend:waiting,requests:reqs.map(r=>({...r,created_ms:Number(r.created_ms),done_ms:r.done_ms?Number(r.done_ms):null}))}});
   }catch(e){next(e)}});
 
   // Sincronizador do computador da escola
@@ -110,8 +111,8 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
     if(!timingSafeEqual(h,Buffer.from(acc.senha_hash,'hex'))){const n=(at?Number(at.failures):0)+1;const lock=n>=4?now()+10*60000:0;await q('INSERT INTO educa_attempts(k,failures,locked) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET failures=excluded.failures,locked=excluded.locked',[key,n,lock]);fail('Senha incorreta.',403)}
     await q('DELETE FROM educa_attempts WHERE k=?',[key]);
   };
-  const HOME_STUDENT=['consultarPix','transferirPix','solicitarEmprestimo','poupancaGuardar','poupancaTirar','jogosComprarMoedas'];
-  const HOME_TEACHER=['registrarMovimentacao','registrarMulta'];
+  const HOME_STUDENT=['consultarPix','transferirPix','solicitarEmprestimo','poupancaGuardar','poupancaTirar','jogosComprarMoedas','msgResponder','msgLer'];
+  const HOME_TEACHER=['registrarMovimentacao','registrarMulta','msgResponder','msgLer'];
   app.post('/api/action',auth,limit('action',60,60000),async(req,res,next)=>{try{
     const {action,payload:p={}}=req.body||{};const role=req.user.role,id=req.user.id;
     if(!(role==='student'?HOME_STUDENT:HOME_TEACHER).includes(action))fail(HOME_MSG,403);
@@ -130,7 +131,9 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
     const pend=Number((await q("SELECT COUNT(*) n FROM educa_requests WHERE role=? AND subject_id=? AND status='esperando'",[role,id]))[0].n);
     if(pend>=8)fail('Você já tem muitos pedidos esperando. Espere o professor responder.',429);
     let out={},spend=0,summary='';
-    if(role==='student'){
+    if(action==='msgResponder'||action==='msgLer'){
+      if(action==='msgResponder'){const body=String(p.body||'').trim().slice(0,500);if(!body)fail('Escreva a mensagem.');out={body};summary=body}
+    }else if(role==='student'){
       const free=Number(dat.student?.available_balance??dat.student?.balance??0)-await pendingSpend('student',id);
       if(action==='transferirPix'){
         if(!dat.config?.permitir_pix)fail('O Pix ainda não está liberado.');
@@ -170,7 +173,7 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
     res.json({request_id:rid,status:'esperando',summary});
   }catch(e){next(e)}});
   app.get('/api/requests',auth,async(req,res,next)=>{try{
-    const rows=await q('SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? ORDER BY created_ms DESC LIMIT 30',[req.user.role,req.user.id]);
+    const rows=await q("SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? AND action NOT IN ('msgResponder','msgLer') ORDER BY created_ms DESC LIMIT 30",[req.user.role,req.user.id]);
     res.json({requests:rows.map(r=>({...r,created_ms:Number(r.created_ms),done_ms:r.done_ms?Number(r.done_ms):null}))});
   }catch(e){next(e)}});
   // O computador da escola busca os pedidos e devolve o resultado
