@@ -77,7 +77,7 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
       if(!exists&&sync){await q('DELETE FROM educa_sessions WHERE token_hash=?',[req.user.th]);fail('Sessão encerrada. Entre novamente.',401)}
       fail('Os dados ainda não chegaram da escola. Tente de novo mais tarde.',503)}
     const sync=await snap('meta','sync');
-    const reqs=await q("SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? AND action NOT IN ('msgResponder','msgLer','jogosIniciar','jogosFinalizar') ORDER BY created_ms DESC LIMIT 30",[req.user.role,req.user.id]);
+    const reqs=await q("SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? AND action NOT IN ('msgResponder','msgLer','jogosIniciar','jogosFinalizar','lerNotificacao','avisoMultaCiente') ORDER BY created_ms DESC LIMIT 30",[req.user.role,req.user.id]);
     const msgWait=(await q("SELECT summary FROM educa_requests WHERE role=? AND subject_id=? AND action='msgResponder' AND status='esperando' ORDER BY created_ms",[req.user.role,req.user.id])).map(r=>r.summary);
     const waiting=Number((await q("SELECT COALESCE(SUM(spend),0) n FROM educa_requests WHERE role=? AND subject_id=? AND status='esperando'",[req.user.role,req.user.id]))[0]?.n||0);
     const base=Number(s.data.student?.available_balance??s.data.student?.balance??0);
@@ -145,9 +145,9 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
       fail(n===3?'Senha incorreta. Atenção: mais um erro e a conta fica bloqueada por um tempo.':'Senha incorreta.',403)}
     await q('DELETE FROM educa_attempts WHERE k=?',[key]);
   };
-  const HOME_STUDENT=['consultarPix','transferirPix','solicitarEmprestimo','poupancaGuardar','poupancaTirar','poupancaMeta','enviarPedido','jogosComprarMoedas','jogosTrocarMedalhas','jogosIniciar','jogosFinalizar','msgResponder','msgLer'];
+  const HOME_STUDENT=['consultarPix','transferirPix','solicitarEmprestimo','poupancaGuardar','poupancaTirar','poupancaMeta','enviarPedido','lerNotificacao','jogosComprarMoedas','jogosTrocarMedalhas','jogosIniciar','jogosFinalizar','msgResponder','msgLer'];
   const syncOk=s=>!!s?.updated_ms&&(now()-Number(s.updated_ms))<30000;
-  const HOME_TEACHER=['registrarMovimentacao','registrarMulta','msgResponder','msgLer'];
+  const HOME_TEACHER=['registrarMovimentacao','registrarMulta','avisoMultaCiente','msgResponder','msgLer'];
   app.post('/api/action',auth,limit('action',60,60000),async(req,res,next)=>{try{
     const {action,payload:p={}}=req.body||{};const role=req.user.role,id=req.user.id;
     if(!(role==='student'?HOME_STUDENT:HOME_TEACHER).includes(action))fail(HOME_MSG,403);
@@ -206,6 +206,8 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
         const sid=Math.floor(Number(p.session_id));if(!(sid>0))fail('Partida não encontrada.');
         const answers=(Array.isArray(p.answers)?p.answers:[]).slice(0,30).map(a=>({question_id:Math.floor(Number(a?.question_id)||0),choice:Math.floor(Number(a?.choice))}));
         out={session_id:sid,score:Math.max(0,Math.min(100000,Math.floor(Number(p.score)||0))),answers};summary='Terminar jogo valendo';
+      }else if(action==='lerNotificacao'){
+        out={};summary='Marcar avisos como lidos';
       }else if(action==='poupancaMeta'){
         const g=p.goal===''||p.goal==null?0:num(p.goal,0,1000000,'Digite um valor certo para a meta.');
         out={goal:g,name:String(p.name||'').trim().slice(0,60)};summary=g>0?'Meta do cofrinho: '+brl(Math.round(g*100)):'Tirar a meta do cofrinho';
@@ -221,6 +223,8 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
         const room=Number(dat.student?.loan_free??dat.student?.loan_limit??0);if(Math.round(amount*100)>room)fail('Esse valor passa do seu limite. Você ainda pode pedir '+brl(room)+'.');
         await verifyPin(id,p.pin);out={amount,count};summary='Pedir empréstimo de '+brl(Math.round(amount*100))+' em '+count+' parcela'+(count>1?'s':'');
       }
+    }else if(action==='avisoMultaCiente'){
+      const aid=Math.floor(Number(p.id));if(!(aid>0))fail('Aviso não encontrado.');out={id:aid};summary='Aviso de multa: já avisei o aluno';
     }else{
       const st=(dat.students||[]).find(s=>s.id===Number(p.student_id));if(!st)fail('Aluno fora da sua turma.',403);
       if(action==='registrarMovimentacao'){
@@ -236,7 +240,7 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
     res.json({request_id:rid,status:'esperando',summary});
   }catch(e){next(e)}});
   app.get('/api/requests',auth,async(req,res,next)=>{try{
-    const rows=await q("SELECT id,action,status,reason,summary,result,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? AND action NOT IN ('msgResponder','msgLer') ORDER BY created_ms DESC LIMIT 30",[req.user.role,req.user.id]);
+    const rows=await q("SELECT id,action,status,reason,summary,result,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? AND action NOT IN ('msgResponder','msgLer','lerNotificacao','avisoMultaCiente') ORDER BY created_ms DESC LIMIT 30",[req.user.role,req.user.id]);
     res.json({requests:rows.map(r=>({...r,result:r.result?JSON.parse(r.result):null,created_ms:Number(r.created_ms),done_ms:r.done_ms?Number(r.done_ms):null}))});
   }catch(e){next(e)}});
   app.post('/api/requests/cancel',auth,limit('cancel',60,60000),async(req,res,next)=>{try{
