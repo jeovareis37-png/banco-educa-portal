@@ -71,7 +71,11 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
 
   app.get('/api/data',auth,async(req,res,next)=>{try{
     const s=await snap('data:'+req.user.role,String(req.user.id));
-    if(!s)fail('Os dados ainda não chegaram da escola. Tente de novo mais tarde.',503);
+    if(!s){const accs=await q("SELECT data FROM educa_snap WHERE kind='account' AND k LIKE ?",[req.user.role+':%']);
+      const exists=accs.some(r=>{try{return Number((typeof r.data==='string'?JSON.parse(r.data):r.data).id)===Number(req.user.id)}catch{return false}});
+      const sync=await snap('meta','sync');
+      if(!exists&&sync){await q('DELETE FROM educa_sessions WHERE token_hash=?',[req.user.th]);fail('Sessão encerrada. Entre novamente.',401)}
+      fail('Os dados ainda não chegaram da escola. Tente de novo mais tarde.',503)}
     const sync=await snap('meta','sync');
     const reqs=await q("SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? AND action NOT IN ('msgResponder','msgLer','jogosIniciar','jogosFinalizar') ORDER BY created_ms DESC LIMIT 30",[req.user.role,req.user.id]);
     const msgWait=(await q("SELECT summary FROM educa_requests WHERE role=? AND subject_id=? AND action='msgResponder' AND status='esperando' ORDER BY created_ms",[req.user.role,req.user.id])).map(r=>r.summary);
@@ -81,13 +85,15 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
     if(req.user.role==='student'){
       // Valores já com os pedidos que esperam: o mesmo número em todas as telas do aluno em casa
       const pend=await q("SELECT action,payload FROM educa_requests WHERE role=? AND subject_id=? AND status='esperando'",[req.user.role,req.user.id]);
-      let dBal=0,dSav=0;
+      let dBal=0,dSav=0;const dMed=[];
       for(const r of pend){let p={};try{p=JSON.parse(r.payload)}catch{}const c=Math.round(Number(p.amount||0)*100);
         if(r.action==='transferirPix')dBal-=c;
         else if(r.action==='poupancaGuardar'){dBal-=c;dSav+=c}
         else if(r.action==='poupancaTirar'){dBal+=c;dSav-=c}
+        else if(r.action==='jogosTrocarMedalhas'){try{dMed.push(JSON.parse(r.payload).game_key)}catch{}}
         else if(r.action==='jogosComprarMoedas')dBal-=Number(dat_coinPrice(s.data))*Number(p.qty||0)}
       free=Math.max(0,base+dBal);
+      if(out.games&&dMed.length)out.games={...out.games,medal_bars:(out.games.medal_bars||[]).map(x=>dMed.includes(x.key)?{...x,n:0}:x)};
       if(out.student){out.student={...out.student,available_balance:free};if(out.student.balance!=null)out.student.balance_with_requests=free}
       if(out.savings){const sv=out.savings;out.savings={...sv,balance:Math.max(0,Number(sv.balance||0)+dSav),available:Math.max(0,Number(sv.available||0)+Math.min(0,dSav)),pending:pend.some(r=>String(r.action).startsWith('poupanca'))}}
     }
@@ -139,7 +145,7 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
       fail(n===3?'Senha incorreta. Atenção: mais um erro e a conta fica bloqueada por um tempo.':'Senha incorreta.',403)}
     await q('DELETE FROM educa_attempts WHERE k=?',[key]);
   };
-  const HOME_STUDENT=['consultarPix','transferirPix','solicitarEmprestimo','poupancaGuardar','poupancaTirar','jogosComprarMoedas','jogosIniciar','jogosFinalizar','msgResponder','msgLer'];
+  const HOME_STUDENT=['consultarPix','transferirPix','solicitarEmprestimo','poupancaGuardar','poupancaTirar','jogosComprarMoedas','jogosTrocarMedalhas','jogosIniciar','jogosFinalizar','msgResponder','msgLer'];
   const syncOk=s=>!!s?.updated_ms&&(now()-Number(s.updated_ms))<30000;
   const HOME_TEACHER=['registrarMovimentacao','registrarMulta','msgResponder','msgLer'];
   app.post('/api/action',auth,limit('action',60,60000),async(req,res,next)=>{try{
@@ -182,6 +188,12 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
         const qty=Math.round(num(p.qty,1,20,'Escolha de 1 a 20 moedas.'));const price=Number(dat.games?.coin_price||0);if(price<=0)fail('A compra de moedas está desligada.');
         const cents=price*qty;if(cents>free)fail('Você não tem saldo livre para isso agora. Seu saldo livre é '+brl(Math.max(0,free))+'.');
         out={qty};spend=cents;summary='Comprar '+qty+' moeda'+(qty>1?'s':'')+' ('+brl(cents)+')';
+      }else if(action==='jogosTrocarMedalhas'){
+        const gk=String(p.game_key||'').slice(0,40);const bar=(dat.games?.medal_bars||[]).find(x=>x.key===gk);
+        if(!bar||Number(bar.n)<10)fail('Faltam medalhas. Você precisa de 10 medalhas deste jogo.');
+        const dup=Number((await q("SELECT COUNT(*) n FROM educa_requests WHERE role=? AND subject_id=? AND action='jogosTrocarMedalhas' AND status='esperando' AND payload LIKE ?",[role,id,'%"game_key":"'+gk+'"%']))[0].n);
+        if(dup>0)fail('Você já pediu essa troca. Espere um pouquinho.');
+        out={game_key:gk};summary='Trocar 10 medalhas por 100 moedas';
       }else if(action==='jogosIniciar'){
         if(!syncOk(await snap('meta','sync')))fail('O banco está fechado nesse momento. Jogue no treino.',503);
         const g=(dat.games?.games||[]).find(x=>x.key===String(p.game_key||''));
