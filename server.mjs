@@ -19,13 +19,23 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
   app.use(express.json({limit:'6mb'}));
   // limite simples por IP para login e sync
   const hits=new Map();
-  const limit=(name,max,ms)=>(req,res,next)=>{const k=name+':'+req.ip,t=now(),a=(hits.get(k)||[]).filter(x=>t-x<ms);if(a.length>=max)return res.status(429).json({error:'Calma! Tente de novo daqui a pouco.'});a.push(t);hits.set(k,a);if(hits.size>5000)for(const [kk,v] of hits)if(!v.some(x=>t-x<ms))hits.delete(kk);next()};
+  const limit=(name,max,ms)=>(req,res,next)=>{const k=name+':'+req.ip,t=now(),a=(hits.get(k)||[]).filter(x=>t-x<ms);if(a.length>=max)return res.status(429).json({error:'Muitas tentativas seguidas. Espere alguns minutos ou chame o professor.'});a.push(t);hits.set(k,a);if(hits.size>5000)for(const [kk,v] of hits)if(!v.some(x=>t-x<ms))hits.delete(kk);next()};
   const snap=async(kind,k)=>{const r=await q('SELECT data,updated_ms FROM educa_snap WHERE kind=? AND k=?',[kind,k]);return r[0]?{data:JSON.parse(r[0].data),updated_ms:Number(r[0].updated_ms)}:null};
   const auth=async(req,res,next)=>{try{const token=req.get('authorization')?.replace(/^Bearer /,'');if(!token||!/^[a-f0-9]{64}$/.test(token))fail('Entre de novo, por favor.',401);const r=await q('SELECT role,subject_id,expires FROM educa_sessions WHERE token_hash=?',[tokenHash(token)]);const s=r[0];if(!s||Number(s.expires)<now())fail('Entre de novo, por favor.',401);req.user={role:s.role,id:Number(s.subject_id),th:tokenHash(token)};next()}catch(e){next(e)}};
 
   app.get('/healthz',(req,res)=>res.json({ok:true}));
   app.get('/api/public',async(req,res,next)=>{try{const m=(await snap('meta','public'))?.data||{};res.json({version:'3.0',name:m.name||'Banco Educa',color:m.color||'#176b55',logo:m.logo||'',currency:m.currency||'R$',setup:false,home:true})}catch(e){next(e)}});
 
+  const LOGIN_MSG='CONTA BLOQUEADA! Aguarde até o dia seguinte ou procure o gerente.';
+  const nextMidnight=()=>{const f=new Intl.DateTimeFormat('en-CA',{timeZone:'America/Sao_Paulo',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(now()));const[y,m,d]=f.split('-').map(Number);return Date.UTC(y,m-1,d+1,3,0,0)};
+  const pinMsg=until=>{const mn=Math.max(1,Math.ceil((until-now())/60000));return 'CONTA BLOQUEADA! Tente de novo em '+mn+' minuto'+(mn>1?'s':'')+'. [[ATE:'+until+']]'};
+  // Conta de aluno bloqueada por senhas erradas: igual à escola, só o gerente libera. O computador da escola recebe o pedido de bloqueio.
+  const blockStudent=async(id,acct)=>{
+    await q('INSERT INTO educa_attempts(k,failures,locked) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET failures=excluded.failures,locked=excluded.locked',['login:student:'+String(acct||'').toUpperCase(),4,nextMidnight()]);
+    await q("DELETE FROM educa_sessions WHERE role='student' AND subject_id=?",[id]);
+    const rid='block-'+id+'-'+now();
+    await q('INSERT INTO educa_requests(id,role,subject_id,action,payload,spend,status,summary,created_ms) VALUES(?,?,?,?,?,?,?,?,?)',[rid,'student',id,'bloquearConta','{}',0,'esperando','Bloquear conta',now()]);
+  };
   app.post('/api/login',limit('login',40,15*60000),async(req,res,next)=>{try{
     const p=req.body||{};
     if(p.role==='admin')fail('O gerente não entra por aqui.',403);
@@ -34,16 +44,20 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
     if(!login||pw.length>128)fail('Usuário/conta ou senha incorretos.',401);
     const key='login:'+p.role+':'+login;
     const at=(await q('SELECT failures,locked FROM educa_attempts WHERE k=?',[key]))[0];
-    if(at&&Number(at.locked)>now())fail('Calma! Tente de novo daqui a pouco.',429);
+    if(at&&Number(at.locked)>now())fail(Number(at.failures)>=4&&Number(at.failures)<1e12&&p.role==='student'?LOGIN_MSG:'Muitas tentativas seguidas. Espere alguns minutos ou chame o professor.',Number(at.failures)>=4&&Number(at.failures)<1e12&&p.role==='student'?403:429);
     const acc=await snap('account',p.role+':'+login);
     const row=acc?.data;
     let ok=false;
     if(row&&/^\d{4}$/.test(pw)&&row.senha_hash){const h=await pbk(pw,row.senha_salt);ok=timingSafeEqual(h,Buffer.from(row.senha_hash,'hex'))}
     else await pbk('0000','00000000000000000000000000000000'); // tempo parecido
-    if(!ok){const n=(at?Number(at.failures):0)+1;const lock=n>=5?now()+Math.min(60,5*2**Math.min(4,n-5))*60000:0;
+    if(!ok&&p.role==='student'&&row?.id&&!row.blocked){const n=(at?Number(at.failures):0)+1;
+      if(n>=4){await blockStudent(row.id,login);fail(LOGIN_MSG,403)}
+      await q('INSERT INTO educa_attempts(k,failures,locked) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET failures=excluded.failures,locked=excluded.locked',[key,n,0]);
+      fail(n===3?'Senha incorreta. Atenção: mais um erro e sua conta será bloqueada.':'Usuário/conta ou senha incorretos.',401)}
+    if(!ok){const n=(at?Number(at.failures):0)+1;const lock=n>=5&&p.role!=='student'?now()+Math.min(60,5*2**Math.min(4,n-5))*60000:0;
       await q('INSERT INTO educa_attempts(k,failures,locked) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET failures=excluded.failures,locked=excluded.locked',[key,n,lock]);
-      fail(n===4?'Senha incorreta. Mais um erro e o acesso fica parado por um tempo.':'Usuário/conta ou senha incorretos.',401)}
-    if(row.blocked)fail('Conta bloqueada. Procure o gerente na escola.',403);
+      fail(n===4&&p.role!=='student'?'Senha incorreta. Mais um erro e o acesso fica parado por um tempo.':'Usuário/conta ou senha incorretos.',401)}
+    if(row.blocked)fail(p.role==='student'?LOGIN_MSG:'Conta bloqueada. Procure o gerente na escola.',403);
     if(row.status&&row.status!=='ativa')fail('Sua conta ainda não está pronta. Fale com o professor.',403);
     if(row.must_change||!row.pin_ready)fail('Primeiro acesso: troque a senha provisória na escola. Depois você entra aqui.',403);
     await q('DELETE FROM educa_attempts WHERE k=?',[key]);
@@ -59,7 +73,7 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
     const s=await snap('data:'+req.user.role,String(req.user.id));
     if(!s)fail('Os dados ainda não chegaram da escola. Tente de novo mais tarde.',503);
     const sync=await snap('meta','sync');
-    const reqs=await q("SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? AND action NOT IN ('msgResponder','msgLer') ORDER BY created_ms DESC LIMIT 30",[req.user.role,req.user.id]);
+    const reqs=await q("SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? AND action NOT IN ('msgResponder','msgLer','jogosIniciar','jogosFinalizar') ORDER BY created_ms DESC LIMIT 30",[req.user.role,req.user.id]);
     const msgWait=(await q("SELECT summary FROM educa_requests WHERE role=? AND subject_id=? AND action='msgResponder' AND status='esperando' ORDER BY created_ms",[req.user.role,req.user.id])).map(r=>r.summary);
     const waiting=Number((await q("SELECT COALESCE(SUM(spend),0) n FROM educa_requests WHERE role=? AND subject_id=? AND status='esperando'",[req.user.role,req.user.id]))[0]?.n||0);
     const base=Number(s.data.student?.available_balance??s.data.student?.balance??0);
@@ -77,7 +91,7 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
       if(out.student){out.student={...out.student,available_balance:free};if(out.student.balance!=null)out.student.balance_with_requests=free}
       if(out.savings){const sv=out.savings;out.savings={...sv,balance:Math.max(0,Number(sv.balance||0)+dSav),available:Math.max(0,Number(sv.available||0)+Math.min(0,dSav)),pending:pend.some(r=>String(r.action).startsWith('poupanca'))}}
     }
-    res.json({...out,home:{online:true,updated_at:sync?.data?.updated_at||null,received_ms:sync?.updated_ms||null,can_act:true,msg_pending:msgWait,free_balance:free,waiting_spend:waiting,requests:reqs.map(r=>({...r,created_ms:Number(r.created_ms),done_ms:r.done_ms?Number(r.done_ms):null}))}});
+    res.json({...out,home:{online:true,pc_online:!!sync?.updated_ms&&(now()-Number(sync.updated_ms))<30000,updated_at:sync?.data?.updated_at||null,received_ms:sync?.updated_ms||null,can_act:true,msg_pending:msgWait,free_balance:free,waiting_spend:waiting,requests:reqs.map(r=>({...r,created_ms:Number(r.created_ms),done_ms:r.done_ms?Number(r.done_ms):null}))}});
   }catch(e){next(e)}});
 
   // Sincronizador do computador da escola
@@ -87,6 +101,12 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
     for(const it of Array.isArray(b.items)?b.items:[]){
       if(!['account','data:student','data:teacher','meta'].includes(it?.kind)||typeof it.k!=='string'||it.k.length>80||it.data===undefined)continue;
       await q('INSERT INTO educa_snap(kind,k,hash,data,updated_ms) VALUES(?,?,?,?,?) ON CONFLICT(kind,k) DO UPDATE SET hash=excluded.hash,data=excluded.data,updated_ms=excluded.updated_ms',[it.kind,it.k,String(it.hash||''),JSON.stringify(it.data),t]);n++}
+    for(const it of Array.isArray(b.items)?b.items:[]){
+      if(it?.kind!=='account'||!/^student:/.test(String(it.k))||!it.data?.id)continue;
+      const ks=['login:'+it.k];
+      for(const k of ks){const at=(await q('SELECT failures,locked FROM educa_attempts WHERE k=?',[k]))[0];if(!at||Number(at.locked)<=now())continue;
+        if(it.data.blocked&&Number(at.failures)<100)await q('UPDATE educa_attempts SET failures=100 WHERE k=?',[k]);
+        else if(!it.data.blocked&&Number(at.failures)>=100)await q('DELETE FROM educa_attempts WHERE k=?',[k])}}
     if(b.keep&&typeof b.keep==='object')for(const kind of ['account','data:student','data:teacher']){
       if(!Array.isArray(b.keep[kind]))continue;const keep=new Set(b.keep[kind].map(String));
       const rows=await q('SELECT k FROM educa_snap WHERE kind=?',[kind]);
@@ -103,15 +123,24 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
   const brl=c=>'R$ '+(c/100).toFixed(2).replace('.',',');
   const pendingSpend=async(role,id)=>Number((await q("SELECT COALESCE(SUM(spend),0) n FROM educa_requests WHERE role=? AND subject_id=? AND status='esperando'",[role,id]))[0]?.n||0);
   const verifyPin=async(id,pin)=>{
-    const acc=(await q("SELECT data FROM educa_snap WHERE kind='account' AND k LIKE 'student:%'",[])).map(r=>JSON.parse(r.data)).find(a=>a.id===id);
+    const accRow=(await q("SELECT k,data FROM educa_snap WHERE kind='account' AND k LIKE 'student:%'",[])).map(r=>({k:r.k,d:JSON.parse(r.data)})).find(a=>a.d.id===id);const acc=accRow?.d,accKey=accRow?.k.slice(8);
     if(!acc||!/^\d{4}$/.test(String(pin||'')))fail('Digite a sua senha de 4 números.',403);
     const key='pin:'+id,at=(await q('SELECT failures,locked FROM educa_attempts WHERE k=?',[key]))[0];
-    if(at&&Number(at.locked)>now())fail('Calma! Tente de novo daqui a pouco.',429);
+    if(acc.blocked)fail(LOGIN_MSG,403);
+    if(at&&Number(at.locked)>now()){
+      if(Number(acc.pin_free_ms||0)>Number(at.failures))await q('DELETE FROM educa_attempts WHERE k=?',[key]);
+      else fail(pinMsg(Number(at.locked)),403)}
+    const cnt=at&&Number(at.failures)<1e12&&Number(at.locked)<=now()?Number(at.failures):0;
     const h=await pbk(String(pin),acc.senha_salt);
-    if(!timingSafeEqual(h,Buffer.from(acc.senha_hash,'hex'))){const n=(at?Number(at.failures):0)+1;const lock=n>=4?now()+10*60000:0;await q('INSERT INTO educa_attempts(k,failures,locked) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET failures=excluded.failures,locked=excluded.locked',[key,n,lock]);fail('Senha incorreta.',403)}
+    if(!timingSafeEqual(h,Buffer.from(acc.senha_hash,'hex'))){const n=cnt+1;
+      if(n>=4){const cfgMin=Number(acc.pin_lock_min)||10;const until=now()+Math.max(1,Math.min(1440,cfgMin))*60000;
+        await q('INSERT INTO educa_attempts(k,failures,locked) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET failures=excluded.failures,locked=excluded.locked',[key,now(),until]);fail(pinMsg(until),403)}
+      await q('INSERT INTO educa_attempts(k,failures,locked) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET failures=excluded.failures,locked=excluded.locked',[key,n,0]);
+      fail(n===3?'Senha incorreta. Atenção: mais um erro e a conta fica bloqueada por um tempo.':'Senha incorreta.',403)}
     await q('DELETE FROM educa_attempts WHERE k=?',[key]);
   };
-  const HOME_STUDENT=['consultarPix','transferirPix','solicitarEmprestimo','poupancaGuardar','poupancaTirar','jogosComprarMoedas','msgResponder','msgLer'];
+  const HOME_STUDENT=['consultarPix','transferirPix','solicitarEmprestimo','poupancaGuardar','poupancaTirar','jogosComprarMoedas','jogosIniciar','jogosFinalizar','msgResponder','msgLer'];
+  const syncOk=s=>!!s?.updated_ms&&(now()-Number(s.updated_ms))<30000;
   const HOME_TEACHER=['registrarMovimentacao','registrarMulta','msgResponder','msgLer'];
   app.post('/api/action',auth,limit('action',60,60000),async(req,res,next)=>{try{
     const {action,payload:p={}}=req.body||{};const role=req.user.role,id=req.user.id;
@@ -153,6 +182,18 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
         const qty=Math.round(num(p.qty,1,20,'Escolha de 1 a 20 moedas.'));const price=Number(dat.games?.coin_price||0);if(price<=0)fail('A compra de moedas está desligada.');
         const cents=price*qty;if(cents>free)fail('Você não tem saldo livre para isso agora. Seu saldo livre é '+brl(Math.max(0,free))+'.');
         out={qty};spend=cents;summary='Comprar '+qty+' moeda'+(qty>1?'s':'')+' ('+brl(cents)+')';
+      }else if(action==='jogosIniciar'){
+        if(!syncOk(await snap('meta','sync')))fail('O banco está fechado nesse momento. Jogue no treino.',503);
+        const g=(dat.games?.games||[]).find(x=>x.key===String(p.game_key||''));
+        if(!g)fail('Esse jogo não está liberado agora.');
+        if(g.closed||g.class_off)fail('Esse jogo está fechado agora.');
+        if(!g.unlocked)fail('Esse jogo ainda está trancado. Complete a barra!');
+        if(Number(dat.games?.coins||0)<(p.again===true?Number(g.continue_cost||1):Number(g.play_cost||1)))fail('Você ainda não tem moedas. Ganhe ou compre moedas!');
+        out={game_key:g.key,again:p.again===true};summary='Começar jogo valendo';
+      }else if(action==='jogosFinalizar'){
+        const sid=Math.floor(Number(p.session_id));if(!(sid>0))fail('Partida não encontrada.');
+        const answers=(Array.isArray(p.answers)?p.answers:[]).slice(0,30).map(a=>({question_id:Math.floor(Number(a?.question_id)||0),choice:Math.floor(Number(a?.choice))}));
+        out={session_id:sid,score:Math.max(0,Math.min(100000,Math.floor(Number(p.score)||0))),answers};summary='Terminar jogo valendo';
       }else if(action==='solicitarEmprestimo'){
         const amount=num(p.amount,0.01,1000000,'Digite um valor certo.');const count=Math.round(num(p.count,1,36,'Escolha as parcelas.'));
         const room=Number(dat.student?.loan_free??dat.student?.loan_limit??0);if(Math.round(amount*100)>room)fail('Esse valor passa do seu limite. Você ainda pode pedir '+brl(room)+'.');
@@ -173,18 +214,25 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
     res.json({request_id:rid,status:'esperando',summary});
   }catch(e){next(e)}});
   app.get('/api/requests',auth,async(req,res,next)=>{try{
-    const rows=await q("SELECT id,action,status,reason,summary,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? AND action NOT IN ('msgResponder','msgLer') ORDER BY created_ms DESC LIMIT 30",[req.user.role,req.user.id]);
-    res.json({requests:rows.map(r=>({...r,created_ms:Number(r.created_ms),done_ms:r.done_ms?Number(r.done_ms):null}))});
+    const rows=await q("SELECT id,action,status,reason,summary,result,created_ms,done_ms FROM educa_requests WHERE role=? AND subject_id=? AND action NOT IN ('msgResponder','msgLer') ORDER BY created_ms DESC LIMIT 30",[req.user.role,req.user.id]);
+    res.json({requests:rows.map(r=>({...r,result:r.result?JSON.parse(r.result):null,created_ms:Number(r.created_ms),done_ms:r.done_ms?Number(r.done_ms):null}))});
+  }catch(e){next(e)}});
+  app.post('/api/requests/cancel',auth,limit('cancel',60,60000),async(req,res,next)=>{try{
+    const id=String(req.body?.request_id||'').slice(0,90);
+    const u=await q("UPDATE educa_requests SET status='nao_deu',reason='Cancelado',done_ms=? WHERE id=? AND role=? AND subject_id=? AND status='esperando' AND action IN ('jogosIniciar','jogosFinalizar') RETURNING id",[now(),id,req.user.role,req.user.id]);
+    res.json({ok:true,canceled:u.length});
   }catch(e){next(e)}});
   // O computador da escola busca os pedidos e devolve o resultado
   app.get('/api/sync/requests',syncAuth,async(req,res,next)=>{try{
+    await q("UPDATE educa_requests SET status='nao_deu',reason='Demorou demais. Tente de novo.',done_ms=? WHERE status='esperando' AND action='jogosIniciar' AND created_ms<?",[now(),now()-120000]);
     const rows=await q("SELECT id,role,subject_id,action,payload,created_ms FROM educa_requests WHERE status='esperando' ORDER BY created_ms ASC LIMIT 25",[]);
     res.json({requests:rows.map(r=>({id:r.id,role:r.role,subject_id:Number(r.subject_id),action:r.action,payload:JSON.parse(r.payload),created_ms:Number(r.created_ms)}))});
   }catch(e){next(e)}});
   app.post('/api/sync/requests/result',limit('syncres',120,60000),syncAuth,async(req,res,next)=>{try{
     let n=0;for(const r of Array.isArray(req.body?.results)?req.body.results:[]){
       if(typeof r?.id!=='string'||!['feito','nao_deu'].includes(r.status))continue;
-      const u=await q("UPDATE educa_requests SET status=?,reason=?,done_ms=?,spend=0 WHERE id=? AND status='esperando' RETURNING id",[r.status,String(r.reason||'').slice(0,300),now(),r.id]);n+=u.length}
+      let dj=null;if(r.data&&typeof r.data==='object'){const t=JSON.stringify(r.data);if(t.length<=20000)dj=t}
+      const u=await q("UPDATE educa_requests SET status=?,reason=?,done_ms=?,spend=0,result=? WHERE id=? AND status='esperando' RETURNING id",[r.status,String(r.reason||'').slice(0,300),now(),dj,r.id]);n+=u.length}
     await q('DELETE FROM educa_requests WHERE done_ms IS NOT NULL AND done_ms<?',[now()-30*86400000]);
     res.json({ok:true,updated:n});
   }catch(e){next(e)}});
