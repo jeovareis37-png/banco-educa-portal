@@ -145,7 +145,7 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
       fail(n===3?'Senha incorreta. Atenção: mais um erro e a conta fica bloqueada por um tempo.':'Senha incorreta.',403)}
     await q('DELETE FROM educa_attempts WHERE k=?',[key]);
   };
-  const HOME_STUDENT=['consultarPix','transferirPix','solicitarEmprestimo','poupancaGuardar','poupancaTirar','jogosComprarMoedas','jogosTrocarMedalhas','jogosIniciar','jogosFinalizar','msgResponder','msgLer'];
+  const HOME_STUDENT=['consultarPix','transferirPix','solicitarEmprestimo','poupancaGuardar','poupancaTirar','poupancaMeta','enviarPedido','jogosComprarMoedas','jogosTrocarMedalhas','jogosIniciar','jogosFinalizar','msgResponder','msgLer'];
   const syncOk=s=>!!s?.updated_ms&&(now()-Number(s.updated_ms))<30000;
   const HOME_TEACHER=['registrarMovimentacao','registrarMulta','msgResponder','msgLer'];
   app.post('/api/action',auth,limit('action',60,60000),async(req,res,next)=>{try{
@@ -206,6 +206,16 @@ export async function createPortal({db,syncKey,distDir,now=()=>Date.now()}){
         const sid=Math.floor(Number(p.session_id));if(!(sid>0))fail('Partida não encontrada.');
         const answers=(Array.isArray(p.answers)?p.answers:[]).slice(0,30).map(a=>({question_id:Math.floor(Number(a?.question_id)||0),choice:Math.floor(Number(a?.choice))}));
         out={session_id:sid,score:Math.max(0,Math.min(100000,Math.floor(Number(p.score)||0))),answers};summary='Terminar jogo valendo';
+      }else if(action==='poupancaMeta'){
+        const g=p.goal===''||p.goal==null?0:num(p.goal,0,1000000,'Digite um valor certo para a meta.');
+        out={goal:g,name:String(p.name||'').trim().slice(0,60)};summary=g>0?'Meta do cofrinho: '+brl(Math.round(g*100)):'Tirar a meta do cofrinho';
+      }else if(action==='enviarPedido'){
+        const items=(Array.isArray(p.items)?p.items:[]).slice(0,30).map(i=>({id:Math.floor(Number(i?.id)||0),quantity:Math.floor(Number(i?.quantity)||0)}));
+        if(!items.length||items.some(i=>i.id<=0||i.quantity<1||i.quantity>99))fail('Escolha os produtos do carrinho.');
+        let total=0,count=0;for(const i of items){const pr=(dat.products||[]).find(x=>Number(x.id)===i.id&&x.active!==0&&x.active!==false);if(!pr)fail('Um produto não está mais disponível.');if(i.quantity>Number(pr.stock))fail('Não tem '+pr.name+' suficiente. Escolha menos.');total+=Number(pr.price)*i.quantity;count+=i.quantity}
+        const room=Number(dat.student?.available_balance||0)+Number(dat.student?.available_credit||0);if(total>room)fail('O pedido passa do que você pode usar.');
+        const dup=Number((await q("SELECT COUNT(*) n FROM educa_requests WHERE role=? AND subject_id=? AND action='enviarPedido' AND status='esperando'",[role,id]))[0].n);if(dup>=2)fail('Você já tem pedidos da Lojinha esperando. Espere um pouquinho.');
+        out={items};summary='Pedido da Lojinha: '+count+' item'+(count>1?'s':'')+' por '+brl(total);
       }else if(action==='solicitarEmprestimo'){
         const amount=num(p.amount,0.01,1000000,'Digite um valor certo.');const count=Math.round(num(p.count,1,36,'Escolha as parcelas.'));
         const room=Number(dat.student?.loan_free??dat.student?.loan_limit??0);if(Math.round(amount*100)>room)fail('Esse valor passa do seu limite. Você ainda pode pedir '+brl(room)+'.');
