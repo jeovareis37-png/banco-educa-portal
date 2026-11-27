@@ -16,5 +16,7 @@ export async function openDb(env=process.env){
   await q('CREATE TABLE IF NOT EXISTS educa_sessions(token_hash TEXT PRIMARY KEY,role TEXT,subject_id INTEGER,expires BIGINT)');
   await q('CREATE TABLE IF NOT EXISTS educa_attempts(k TEXT PRIMARY KEY,failures INTEGER,locked BIGINT)');
   await q('CREATE TABLE IF NOT EXISTS educa_requests(id TEXT PRIMARY KEY,role TEXT NOT NULL,subject_id INTEGER NOT NULL,action TEXT NOT NULL,payload TEXT NOT NULL,spend BIGINT DEFAULT 0,status TEXT NOT NULL,reason TEXT,summary TEXT,created_ms BIGINT NOT NULL,done_ms BIGINT)');
+  await q('ALTER TABLE educa_requests ADD COLUMN IF NOT EXISTS result TEXT');
+  await q('ALTER TABLE educa_attempts ALTER COLUMN failures TYPE BIGINT');
   return {q};
 }
